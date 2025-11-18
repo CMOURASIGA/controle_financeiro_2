@@ -1,27 +1,28 @@
 /***********************************************************************************
  * BACKEND – CONTROLE FINANCEIRO WEBAPP
- * Planilha: Controle Financeiro WebApp
- * Abas:
- *   - transacoes: id, data, tipo, categoria, descricao, valor, status, mes_ref
- *   - config: categorias_receita (col A), categorias_despesa (col B)
  ***********************************************************************************/
 
-/**
- * CONFIGURAÇÕES GERAIS
- */
-const SPREADSHEET_ID = '1i8DEPlvMDRbuRcWcVc3D5QmQVXuoOgywDan2ohtdSNw';
-const SHEET_TRANSACOES = 'transacoes';
-const SHEET_CONFIG = 'config';
+// Se quiser mover as planilhas para uma pasta específica do seu Drive,
+// coloque aqui o ID da pasta. Se não quiser, deixe string vazia.
+const PASTA_ID     = ''; 
 
-// Índices de coluna (1-based para Apps Script)
-const COL_ID      = 1; // A
-const COL_DATA    = 2; // B
-const COL_TIPO    = 3; // C
-const COL_CATEG   = 4; // D
-const COL_DESC    = 5; // E
-const COL_VALOR   = 6; // F
-const COL_STATUS  = 7; // G
-const COL_MES_REF = 8; // H
+// Prefixo do nome da planilha criada para cada usuário:
+const PREFIXO_NOME = 'Controle Financeiro - ';
+
+// Nomes das abas
+const SHEET_TRANSACOES = 'transacoes';
+const SHEET_CONFIG     = 'config';
+
+// Índices de coluna
+const COL_ID      = 1;
+const COL_DATA    = 2;
+const COL_TIPO    = 3;
+const COL_CATEG   = 4;
+const COL_DESC    = 5;
+const COL_VALOR   = 6;
+const COL_STATUS  = 7;
+const COL_MES_REF = 8;
+
 
 function doGet() {
   return HtmlService
@@ -30,10 +31,133 @@ function doGet() {
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
+/**
+ * MULTI-USUÁRIO
+ * - Dono (OWNER_EMAIL) → sempre usa a planilha fixa SPREADSHEET_ID
+ * - Outros usuários    → planilha própria "Controle Financeiro - <email>"
+ */
 
-function getSpreadsheet_() {
-  return SpreadsheetApp.openById(SPREADSHEET_ID);
+function getOrCreateUserSpreadsheet_() {
+  const email = Session.getActiveUser().getEmail() || 'usuario';
+
+  // Vamos guardar o ID da planilha deste usuário nas UserProperties
+  const userProps = PropertiesService.getUserProperties();
+  const KEY = 'CF_SPREADSHEET_ID';
+
+  // 1) Tenta usar um ID já salvo
+  const existingId = userProps.getProperty(KEY);
+  if (existingId) {
+    try {
+      return SpreadsheetApp.openById(existingId);
+    } catch (e) {
+      Logger.log('ID salvo inválido, recriando planilha: ' + e.message);
+      // segue para recriar
+    }
+  }
+
+  // 2) Usa lock de usuário para evitar corrida entre múltiplas execuções
+  const lock = LockService.getUserLock();
+  lock.waitLock(30000); // espera até 30s se outro processo estiver criando
+
+  try {
+    // Confere de novo depois de pegar o lock,
+    // pode ser que outra execução já tenha criado a planilha
+    const idAfterLock = userProps.getProperty(KEY);
+    if (idAfterLock) {
+      return SpreadsheetApp.openById(idAfterLock);
+    }
+
+    const nomeArquivo = PREFIXO_NOME + email;
+    let ss;
+
+    // Verifica se já existe por nome (caso o usuário tenha apagado as props)
+    const files = DriveApp.getFilesByName(nomeArquivo);
+    if (files.hasNext()) {
+      ss = SpreadsheetApp.open(files.next());
+    } else {
+      // Cria uma nova planilha para esse usuário
+      ss = SpreadsheetApp.create(nomeArquivo);
+
+      // (Opcional) move para uma pasta específica
+      if (PASTA_ID && PASTA_ID.trim()) {
+        try {
+          const pasta = DriveApp.getFolderById(PASTA_ID);
+          const file = DriveApp.getFileById(ss.getId());
+          pasta.addFile(file);
+          DriveApp.getRootFolder().removeFile(file);
+        } catch (e) {
+          Logger.log('Erro ao mover para pasta: ' + e.message);
+        }
+      }
+
+      // Monta estrutura inicial (abas + cabeçalhos + categorias)
+      inicializarEstrutura_(ss);
+    }
+
+    // Salva o ID para próximas execuções desse usuário
+    userProps.setProperty(KEY, ss.getId());
+
+    return ss;
+  } finally {
+    lock.releaseLock();
+  }
 }
+
+
+/**
+ * Inicialização da estrutura padrão para uma planilha nova
+ */
+function inicializarEstrutura_(ss) {
+  // Remove aba padrão "Planilha1", se existir
+  const sheetPadrao = ss.getSheets()[0];
+  if (sheetPadrao && sheetPadrao.getName() === 'Planilha1') {
+    ss.deleteSheet(sheetPadrao);
+  }
+
+  // Aba de transações
+  let shTx = ss.getSheetByName(SHEET_TRANSACOES);
+  if (!shTx) {
+    shTx = ss.insertSheet(SHEET_TRANSACOES);
+  }
+  shTx.getRange(1, 1, 1, 8).setValues([[
+    'id', 'data', 'tipo', 'categoria', 'descricao', 'valor', 'status', 'mes_ref'
+  ]]);
+
+  // Aba de config
+  let shCfg = ss.getSheetByName(SHEET_CONFIG);
+  if (!shCfg) {
+    shCfg = ss.insertSheet(SHEET_CONFIG);
+  }
+  shCfg.getRange(1, 1, 1, 2).setValues([[
+    'categorias_receita', 'categorias_despesa'
+  ]]);
+  shCfg.getRange(2, 1, 3, 1).setValues([
+    ['Salário'],
+    ['Freelancer'],
+    ['Outros']
+  ]);
+  shCfg.getRange(2, 2, 6, 1).setValues([
+    ['Aluguel'],
+    ['Cartão de crédito'],
+    ['Mercado'],
+    ['Assinaturas'],
+    ['Lazer'],
+    ['Outros']
+  ]);
+}
+
+
+/**
+ * Pega a planilha correta:
+ * - Se for o dono (OWNER_EMAIL) ou e-mail vazio → usa planilha mestre por ID
+ * - Senão → usa/gera a planilha específica do usuário
+ */
+function getSpreadsheet_() {
+  // Neste modelo, SEM dono fixo:
+  // sempre pega (ou cria) a planilha do usuário logado.
+  return getOrCreateUserSpreadsheet_();
+}
+
 
 function getSheet_(name) {
   const ss = getSpreadsheet_();
@@ -64,8 +188,7 @@ function buildErrorResponse_(message) {
 }
 
 /**
- * Opcional: inicializar cabeçalhos
- * (Use apenas se a aba estiver vazia – no seu caso já está ok.)
+ * Opcional: inicializar cabeçalhos na planilha atual
  */
 function initializeSheet() {
   const ss = getSpreadsheet_();
@@ -214,7 +337,6 @@ function getTransactionsByMonth(mesRef) {
   }
 }
 
-
 function testGetTransactions() {
   const mesRef = '2025-11'; // você pode mudar aqui se quiser testar outro mês
   const resp = getTransactionsByMonth(mesRef);
@@ -298,8 +420,8 @@ function getMonthlySummary(mesRef) {
       }
     });
 
-    const saldoPrevisto = receitaTotal - (despesaPaga + despesaPendente);
-    const saldoRealizado = receitaTotal - despesaPaga;
+    const saldoPrevisto   = receitaTotal - (despesaPaga + despesaPendente);
+    const saldoRealizado  = receitaTotal - despesaPaga;
 
     const summary = {
       receitaTotal: receitaTotal,
@@ -311,7 +433,6 @@ function getMonthlySummary(mesRef) {
 
     Logger.log('Resumo calculado: %s', JSON.stringify(summary));
 
-    // IMPORTANTE: aqui o front espera exatamente { success, resumo }
     return {
       success: true,
       resumo: summary
@@ -322,7 +443,6 @@ function getMonthlySummary(mesRef) {
     return buildErrorResponse_(e.message);
   }
 }
-
 
 /**
  * 3. Categorias (getCategories no frontend)
@@ -385,6 +505,42 @@ function getCategories() {
   }
 }
 
+function parseLocalDate_(isoDateStr) {
+  // Se não vier nada, usa a data de hoje
+  if (!isoDateStr) {
+    const hoje = new Date();
+    hoje.setHours(0, 0, 0, 0);
+    return hoje;
+  }
+
+  // Espera formato "yyyy-MM-dd"
+  var parts = String(isoDateStr).split('-');
+  if (parts.length === 3) {
+    var year  = Number(parts[0]);
+    var month = Number(parts[1]); // 1–12
+    var day   = Number(parts[2]);
+
+    if (year && month && day) {
+      // new Date(ano, mes-1, dia) usa o fuso horário local do script
+      var dLocal = new Date(year, month - 1, day);
+      dLocal.setHours(0, 0, 0, 0);
+      return dLocal;
+    }
+  }
+
+  // Fallback: tenta parse normal
+  var d = new Date(isoDateStr);
+  if (!isNaN(d.getTime())) {
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  // Se nada der certo, devolve hoje
+  var hoje2 = new Date();
+  hoje2.setHours(0, 0, 0, 0);
+  return hoje2;
+}
+
 
 /**
  * 4. Salvar transação (saveTransaction no frontend)
@@ -402,7 +558,6 @@ function saveTransaction(tx) {
     const sh = getSheet_(SHEET_TRANSACOES);
     const lastRow = sh.getLastRow();
 
-    // Garante cabeçalho se a aba estiver vazia
     if (lastRow === 0) {
       sh.getRange(1, 1, 1, 8).setValues([[
         'id', 'data', 'tipo', 'categoria', 'descricao', 'valor', 'status', 'mes_ref'
@@ -416,10 +571,10 @@ function saveTransaction(tx) {
       nextId = Number(lastId || 0) + 1;
     }
 
-    // data: se vier string "2025-11-14", converte para Date
-    const dataCell = tx.data
-      ? new Date(tx.data)
-      : new Date();
+    // >>> AQUI TROCAMOS <<<
+    const dataCell = parseLocalDate_(tx.data);
+    const tz = Session.getScriptTimeZone();
+    const mesRefAuto = Utilities.formatDate(dataCell, tz, 'yyyy-MM');
 
     const row = [
       nextId,
@@ -429,7 +584,7 @@ function saveTransaction(tx) {
       tx.descricao || '',
       Number(tx.valor || 0),
       tx.status || '',
-      tx.mesRef || ''
+      tx.mesRef || mesRefAuto
     ];
 
     sh.appendRow(row);
@@ -446,21 +601,20 @@ function saveTransaction(tx) {
   }
 }
 
+
 function getMonthRangeFromMesRef_(mesRef) {
   if (!mesRef) return null;
 
   var parts = String(mesRef).split('-');
   if (parts.length < 2) return null;
 
-  var year = Number(parts[0]);
+  var year  = Number(parts[0]);
   var month = Number(parts[1]); // 1–12
 
   if (!year || !month) return null;
 
-  // Início do mês
-  var start = new Date(year, month - 1, 1);
-  // Início do próximo mês (intervalo exclusivo)
-  var end = new Date(year, month, 1);
+  var start = new Date(year, month - 1, 1); // início do mês
+  var end   = new Date(year, month, 1);     // início do próximo mês
 
   return { start: start, end: end };
 }
@@ -472,7 +626,6 @@ function dateInRange_(dateValue, start, end) {
   if (dateValue instanceof Date) {
     d = dateValue;
   } else {
-    // tenta converter string/numero em Date
     d = new Date(dateValue);
     if (isNaN(d.getTime())) return false;
   }
@@ -489,5 +642,83 @@ function testGetSummary() {
 function testGetCategories() {
   const resp = getCategories();
   Logger.log('Resultado testGetCategories: %s', JSON.stringify(resp));
+}
+
+function findRowById_(id) {
+  const sh = getSheet_(SHEET_TRANSACOES);
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return -1;
+
+  const idRange = sh.getRange(2, COL_ID, lastRow - 1, 1).getValues(); // coluna A
+  for (var i = 0; i < idRange.length; i++) {
+    const value = idRange[i][0];
+    if (Number(value) === Number(id)) {
+      return i + 2; // linha real na planilha
+    }
+  }
+  return -1;
+}
+
+function updateTransaction(tx) {
+  try {
+    if (!tx || !tx.id) {
+      return buildErrorResponse_('Transação inválida: id não informado.');
+    }
+
+    const sh = getSheet_(SHEET_TRANSACOES);
+    const rowIndex = findRowById_(tx.id);
+
+    if (rowIndex === -1) {
+      return buildErrorResponse_('Transação não encontrada para o id: ' + tx.id);
+    }
+
+    // >>> AQUI TROCAMOS <<<
+    const dataCell = parseLocalDate_(tx.data);
+    const tz = Session.getScriptTimeZone();
+    const mesRefAuto = Utilities.formatDate(dataCell, tz, 'yyyy-MM');
+
+    const rowValues = [
+      Number(tx.id),
+      dataCell,
+      tx.tipo || '',
+      tx.categoria || '',
+      tx.descricao || '',
+      Number(tx.valor || 0),
+      tx.status || '',
+      tx.mesRef || mesRefAuto
+    ];
+
+    sh.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+
+    return buildSuccessResponse_(null, { id: tx.id });
+  } catch (e) {
+    return buildErrorResponse_(e.message);
+  }
+}
+
+
+function deleteTransaction(id) {
+  try {
+    if (!id) {
+      return buildErrorResponse_('Id não informado para exclusão.');
+    }
+
+    const sh = getSheet_(SHEET_TRANSACOES);
+    const rowIndex = findRowById_(id);
+
+    if (rowIndex === -1) {
+      return buildErrorResponse_('Transação não encontrada para o id: ' + id);
+    }
+
+    sh.deleteRow(rowIndex);
+
+    return buildSuccessResponse_(null, { id: id });
+  } catch (e) {
+    return buildErrorResponse_(e.message);
+  }
+}
+function _autorizarDrive_() {
+  // só para pedir escopo de Drive
+  DriveApp.getRootFolder();
 }
 
